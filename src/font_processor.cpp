@@ -44,7 +44,16 @@ struct Contour {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-static constexpr float VERTEX_EPS = 0.01f;  // dedup tolerance in scaled font units
+static constexpr float VERTEX_EPS = 1.00f;  // dedup tolerance in scaled font units
+
+// Adaptive curve subdivision parameters
+// NOTE: threshold set very high to effectively DISABLE subdivision.
+// Loop-Blinn curve rendering needs large CONVEX/CONCAVE triangles for
+// the GPU shader to smoothly evaluate curve boundaries. Aggressive
+// subdivision shrinks these triangles to sub-pixel slivers, defeating
+// the purpose. The shader handles smooth curves at any resolution.
+static constexpr float CURVE_FLATNESS_THRESHOLD = 9999.0f;  // effectively disabled
+static constexpr int   CURVE_MAX_SUBDIVISION    = 50;
 
 // Signed area of a polygon ring (positive = CCW in Y-up)
 static float signedArea(const std::vector<std::array<float,2>>& ring)
@@ -88,6 +97,69 @@ static bool samePoint(const std::array<float,2>& a, const std::array<float,2>& b
 {
     float dx = a[0] - b[0], dy = a[1] - b[1];
     return dx*dx + dy*dy < VERTEX_EPS * VERTEX_EPS;
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive quadratic Bezier subdivision (De Casteljau)
+// Recursively splits curves until they are flat enough, appending sub-curves
+// and intermediate on-curve points into the contour.
+// ---------------------------------------------------------------------------
+static void subdivideCurve(
+    const std::array<float,2>& a,
+    const std::array<float,2>& ctrl,
+    const std::array<float,2>& b,
+    float threshold,
+    int maxDepth,
+    int depth,
+    std::vector<std::array<float,2>>& allVerts,
+    Contour& contour,
+    const std::array<float,2>& firstPt)
+{
+    // Compute flatness: squared perpendicular distance from ctrl to chord a-b
+    float abx = b[0] - a[0], aby = b[1] - a[1];
+    float acx = ctrl[0] - a[0], acy = ctrl[1] - a[1];
+    float abLenSq = abx * abx + aby * aby;
+    float crossVal = abx * acy - aby * acx;
+
+    // flatnessSq = (perpendicular distance)^2
+    float flatnessSq;
+    if (abLenSq > 1e-12f)
+        flatnessSq = (crossVal * crossVal) / abLenSq;
+    else
+        flatnessSq = acx * acx + acy * acy;  // degenerate chord: use distance a->ctrl
+
+    float threshSq = threshold * threshold;
+
+    if (flatnessSq <= threshSq || depth >= maxDepth) {
+        // Flat enough — emit this curve segment as-is
+        uint32_t aIdx = addVertex(allVerts, a);
+        uint32_t cIdx = addVertex(allVerts, ctrl);
+        uint32_t bIdx = addVertex(allVerts, b);
+
+        CurveSegment seg;
+        seg.a = aIdx;
+        seg.c = cIdx;
+        seg.b = bIdx;
+        seg.isConvex = false; // determined later
+        contour.curves.push_back(seg);
+
+        // Add endpoint to polygon ring (skip if it closes back to contour start)
+        if (!samePoint(b, firstPt)) {
+            contour.ringPts.push_back(b);
+            contour.ringToFull.push_back(bIdx);
+        }
+        return;
+    }
+
+    // De Casteljau split at t = 0.5
+    std::array<float,2> m01 = { (a[0] + ctrl[0]) * 0.5f, (a[1] + ctrl[1]) * 0.5f };
+    std::array<float,2> m12 = { (ctrl[0] + b[0]) * 0.5f, (ctrl[1] + b[1]) * 0.5f };
+    std::array<float,2> mid = { (m01[0] + m12[0]) * 0.5f, (m01[1] + m12[1]) * 0.5f };
+
+    // First half: (a, m01, mid)
+    subdivideCurve(a,   m01, mid, threshold, maxDepth, depth + 1, allVerts, contour, firstPt);
+    // Second half: (mid, m12, b)
+    subdivideCurve(mid, m12, b,   threshold, maxDepth, depth + 1, allVerts, contour, firstPt);
 }
 
 // ---------------------------------------------------------------------------
@@ -182,22 +254,14 @@ Glyphlet FontProcessor::processGlyph(int codepoint)
             else if (verts[i].type == STBTT_vcurve) {
                 std::array<float,2> ctrlPt = {verts[i].cx * m_scale, verts[i].cy * m_scale};
 
-                uint32_t aIdx = addVertex(allVerts, prevPt);
-                uint32_t cIdx = addVertex(allVerts, ctrlPt);
-                uint32_t bIdx = addVertex(allVerts, endPt);
+                // Adaptive subdivision: recursively split sharp curves into
+                // smaller sub-curves for smoother polygon rings and better
+                // triangle quality. Flat curves pass through as a single segment.
+                subdivideCurve(prevPt, ctrlPt, endPt,
+                               CURVE_FLATNESS_THRESHOLD,
+                               CURVE_MAX_SUBDIVISION,
+                               0, allVerts, contour, firstPt);
 
-                CurveSegment seg;
-                seg.a = aIdx;
-                seg.c = cIdx;
-                seg.b = bIdx;
-                seg.isConvex = false; // determined later
-                contour.curves.push_back(seg);
-
-                // Add endpoint to polygon ring (skip if it closes back to start)
-                if (!samePoint(endPt, firstPt)) {
-                    contour.ringPts.push_back(endPt);
-                    contour.ringToFull.push_back(bIdx);
-                }
                 prevPt = endPt;
             }
             ++i;

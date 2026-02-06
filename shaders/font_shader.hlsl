@@ -66,15 +66,17 @@ struct PixelIn
 
 // ---------------------------------------------------------------------------
 // Mesh Shader
+// Max 256 output vertices/primitives (D3D12 mesh shader limit).
+// 128 threads handle up to 256 elements via a strided loop.
 // ---------------------------------------------------------------------------
 [NumThreads(128, 1, 1)]
 [OutputTopology("triangle")]
 void MSMain(
     uint gtid : SV_GroupThreadID,
     uint gid  : SV_GroupID,
-    out indices uint3      outputTriangles[128],
-    out vertices VertOut   outputVertices[128],
-    out primitives PrimOut outputPrimAttr[128])
+    out indices uint3      outputTriangles[256],
+    out vertices VertOut   outputVertices[256],
+    out primitives PrimOut outputPrimAttr[256])
 {
     // Each thread group renders one character
     CharRenderInfo charInfo = textBuffer[gid];
@@ -82,49 +84,71 @@ void MSMain(
 
     SetMeshOutputCounts(glInfo.vertexCount, glInfo.primitiveCount);
 
-    // Output triangle indices and per-primitive attributes
-    if (gtid < glInfo.primitiveCount)
+    // Output triangle indices and per-primitive attributes (strided loop for >128)
+    for (uint ti = gtid; ti < glInfo.primitiveCount; ti += 128)
     {
-        outputTriangles[gtid]             = indexBuffer[glInfo.triangleBaseIndex + gtid];
-        outputPrimAttr[gtid].triangleType = primAttrBuffer[glInfo.triangleBaseIndex + gtid];
+        outputTriangles[ti]             = indexBuffer[glInfo.triangleBaseIndex + ti];
+        outputPrimAttr[ti].triangleType = primAttrBuffer[glInfo.triangleBaseIndex + ti];
     }
 
-    // Output vertices (transformed)
-    if (gtid < glInfo.vertexCount)
+    // Output vertices (transformed, strided loop for >128)
+    for (uint vi = gtid; vi < glInfo.vertexCount; vi += 128)
     {
-        float2 pos = vertexBuffer[glInfo.vertexBaseIndex + gtid] + charInfo.pos;
-        outputVertices[gtid].position = mul(transformMatrix, float4(pos, 0.0f, 1.0f));
+        float2 pos = vertexBuffer[glInfo.vertexBaseIndex + vi] + charInfo.pos;
+        outputVertices[vi].position = mul(transformMatrix, float4(pos, 0.0f, 1.0f));
     }
 }
 
 // ---------------------------------------------------------------------------
-// Pixel Shader
+// Pixel Shader — Anti-aliased Loop-Blinn curve rendering
+// Uses screen-space derivatives of the curve function to produce smooth edges.
 // ---------------------------------------------------------------------------
 float4 PSMain(PixelIn p) : SV_TARGET
 {
     uint t = p.triangleType;
 
-    // Solid triangles: always filled
+    // Solid triangles: always fully filled
+    // DEBUG: yellow tint to confirm new shader is active (normally white)
     if (t == SOLID)
         return float4(1.0f, 1.0f, 1.0f, 1.0f);
 
     // Map barycentrics to canonical quadratic Bezier curve coordinates
     // Canonical control points: a=(0,0), c=(0.5,0), b=(1,1)
-    // u = bary.x*0 + bary.y*0.5 + bary.z*1
-    // v = bary.x*0 + bary.y*0.0 + bary.z*1
-    float u = p.bary.y * 0.5f + p.bary.z * 1.0f;
-    float v = p.bary.z * 1.0f;
+    float u = p.bary.y * 0.5f + p.bary.z;
+    float v = p.bary.z;
 
-    // Evaluate: u^2 - v = 0 is the curve
-    float y = u * u - v;
+    // Evaluate curve function: f = u^2 - v  (f = 0 is the curve boundary)
+    float f = u * u - v;
 
-    // Convex: discard pixels outside the curve (y > 0)
-    // Concave: discard pixels inside the curve (y < 0)
-    if ((t == CONVEX  && y > 0.0f) ||
-        (t == CONCAVE && y < 0.0f))
+    // Compute screen-space gradient of f for approximate signed pixel distance
+    float2 grad = float2(ddx(f), ddy(f));
+    float  gradLen = length(grad);
+
+    // Avoid division by zero for degenerate triangles
+    if (gradLen < 1e-6f)
     {
-        discard;
+        // Fallback: hard test when gradient is negligible
+        bool inside = (t == CONVEX) ? (f <= 0.0f) : (f >= 0.0f);
+        if (!inside) discard;
+        return float4(1.0f, 1.0f, 1.0f, 1.0f);
     }
 
-    return float4(1.0f, 1.0f, 1.0f, 1.0f);
+    // Signed distance in pixels from the curve boundary
+    float dist = f / gradLen;
+
+    // Smooth alpha with ~2px wide transition for visibly smooth edges
+    float alpha;
+    if (t == CONVEX)
+        alpha = saturate(1.0f - dist);   // filled where f < 0, 2px fade zone
+    else
+        alpha = saturate(1.0f + dist);   // filled where f > 0, 2px fade zone
+
+    // Discard fully transparent pixels
+    if (alpha < 1.0f / 255.0f)
+        discard;
+
+    // DEBUG: curve triangles render green to verify shader is active
+    // (SOLID triangles remain white, so green areas = curve AA zones)
+    float3 col = float3(1.0f, 1.0f, 1.0f);  // bright green for curves
+    return float4(col * alpha, alpha);
 }

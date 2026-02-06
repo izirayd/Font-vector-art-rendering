@@ -411,8 +411,15 @@ static void CreatePipelineState()
     raster.DepthClipEnable       = TRUE;
     psoStream.Rasterizer.pInner  = raster;
 
-    // Blend (default - no blending)
+    // Blend (premultiplied alpha for anti-aliased curve edges)
     D3D12_BLEND_DESC blend = {};
+    blend.RenderTarget[0].BlendEnable           = TRUE;
+    blend.RenderTarget[0].SrcBlend              = D3D12_BLEND_ONE;            // premultiplied src
+    blend.RenderTarget[0].DestBlend             = D3D12_BLEND_INV_SRC_ALPHA;
+    blend.RenderTarget[0].BlendOp               = D3D12_BLEND_OP_ADD;
+    blend.RenderTarget[0].SrcBlendAlpha         = D3D12_BLEND_ONE;
+    blend.RenderTarget[0].DestBlendAlpha        = D3D12_BLEND_INV_SRC_ALPHA;
+    blend.RenderTarget[0].BlendOpAlpha          = D3D12_BLEND_OP_ADD;
     blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     psoStream.Blend.pInner = blend;
 
