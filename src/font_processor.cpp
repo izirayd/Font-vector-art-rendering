@@ -10,6 +10,7 @@
 #include <fstream>
 #include <numeric>
 #include <set>
+#include <utility>
 
 // ---------------------------------------------------------------------------
 // earcut adapter for std::array<float,2>
@@ -38,6 +39,7 @@ struct Contour {
     std::vector<std::array<float,2>> ringPts;     // polygon ring for earcut
     std::vector<uint32_t>            ringToFull;   // ring index -> allVerts index
     std::vector<CurveSegment>        curves;       // quadratic Bezier curves
+    bool                             isHole = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -166,7 +168,51 @@ static void subdivideCurve(
 // FontProcessor
 // ---------------------------------------------------------------------------
 
-bool FontProcessor::loadFont(const std::string& fontPath, float pixelHeight)
+FontProcessor::~FontProcessor()
+{
+    if (m_fontInfo) {
+        delete static_cast<stbtt_fontinfo*>(m_fontInfo);
+        m_fontInfo = nullptr;
+    }
+}
+
+FontProcessor::FontProcessor(FontProcessor&& other) noexcept
+{
+    m_fontFileData = std::move(other.m_fontFileData);
+    m_fontInfo = other.m_fontInfo;
+    m_scale = other.m_scale;
+    m_cache = std::move(other.m_cache);
+
+    other.m_fontInfo = nullptr;
+    other.m_scale = 1.0f;
+    other.m_cache.clear();
+    other.m_fontFileData.clear();
+}
+
+FontProcessor& FontProcessor::operator=(FontProcessor&& other) noexcept
+{
+    if (this == &other)
+        return *this;
+
+    if (m_fontInfo) {
+        delete static_cast<stbtt_fontinfo*>(m_fontInfo);
+        m_fontInfo = nullptr;
+    }
+
+    m_fontFileData = std::move(other.m_fontFileData);
+    m_fontInfo = other.m_fontInfo;
+    m_scale = other.m_scale;
+    m_cache = std::move(other.m_cache);
+
+    other.m_fontInfo = nullptr;
+    other.m_scale = 1.0f;
+    other.m_cache.clear();
+    other.m_fontFileData.clear();
+
+    return *this;
+}
+
+bool FontProcessor::loadFont(const std::filesystem::path& fontPath, float pixelHeight)
 {
     std::ifstream ifs(fontPath, std::ios::binary);
     if (!ifs) return false;
@@ -174,19 +220,29 @@ bool FontProcessor::loadFont(const std::string& fontPath, float pixelHeight)
     ifs.seekg(0, std::ios::end);
     size_t sz = (size_t)ifs.tellg();
     ifs.seekg(0, std::ios::beg);
-    m_fontFileData.resize(sz);
-    ifs.read(reinterpret_cast<char*>(m_fontFileData.data()), sz);
+    std::vector<uint8_t> newFontData;
+    newFontData.resize(sz);
+    ifs.read(reinterpret_cast<char*>(newFontData.data()), sz);
     if (!ifs) return false;
 
-    auto* info = new stbtt_fontinfo;
-    if (!stbtt_InitFont(info, m_fontFileData.data(),
-                        stbtt_GetFontOffsetForIndex(m_fontFileData.data(), 0)))
+    auto* newInfo = new stbtt_fontinfo;
+    if (!stbtt_InitFont(newInfo, newFontData.data(),
+                        stbtt_GetFontOffsetForIndex(newFontData.data(), 0)))
     {
-        delete info;
+        delete newInfo;
         return false;
     }
-    m_fontInfo = info;
-    m_scale = stbtt_ScaleForPixelHeight(info, pixelHeight);
+
+    // Commit (only after full success) so a failed load does not destroy the currently loaded font.
+    if (m_fontInfo) {
+        delete static_cast<stbtt_fontinfo*>(m_fontInfo);
+        m_fontInfo = nullptr;
+    }
+
+    m_fontFileData = std::move(newFontData);
+    m_fontInfo = newInfo;
+    m_scale = stbtt_ScaleForPixelHeight(newInfo, pixelHeight);
+    m_cache.clear();
     return true;
 }
 
@@ -278,22 +334,50 @@ Glyphlet FontProcessor::processGlyph(int codepoint)
     }
 
     // ---------------------------------------------------------------
-    // 2. Determine convex/concave for each curve
+    // 2. Identify outer contour vs holes
+    //    We treat the largest contour (by |signed area|) as the outer ring
+    //    and all other contours as holes. This matches how we feed earcut.
+    // ---------------------------------------------------------------
+    size_t outerContourIndex = 0;
+    float  outerAbsArea      = 0.0f;
+    std::vector<float> contourSignedAreas(contours.size(), 0.0f);
+    for (size_t ci = 0; ci < contours.size(); ++ci) {
+        float a = signedArea(contours[ci].ringPts);
+        contourSignedAreas[ci] = a;
+        float aa = std::fabs(a);
+        if (aa > outerAbsArea) {
+            outerAbsArea = aa;
+            outerContourIndex = ci;
+        }
+    }
+    for (size_t ci = 0; ci < contours.size(); ++ci) {
+        contours[ci].isHole = (ci != outerContourIndex);
+    }
+
+    // ---------------------------------------------------------------
+    // 3. Determine convex/concave for each curve
     //    convex  = control point is OUTSIDE the filled area
     //    concave = control point is INSIDE the filled area
+    //
+    // IMPORTANT: for hole contours the filled area is OUTSIDE the ring,
+    // so convex/concave must be flipped relative to the contour's interior.
     // ---------------------------------------------------------------
-    for (auto& contour : contours) {
-        float area = signedArea(contour.ringPts);
+    for (size_t ci = 0; ci < contours.size(); ++ci) {
+        auto& contour = contours[ci];
+        float area = contourSignedAreas[ci];
         for (auto& curve : contour.curves) {
             // cross = (endPt - startPt) x (ctrlPt - startPt)
             float cr = cross2D(allVerts[curve.a], allVerts[curve.b], allVerts[curve.c]);
             // If cross and area have opposite signs -> control is outside -> convex
-            curve.isConvex = (cr * area) < 0.0f;
+            bool isConvex = (cr * area) < 0.0f;
+            if (contour.isHole)
+                isConvex = !isConvex;
+            curve.isConvex = isConvex;
         }
     }
 
     // ---------------------------------------------------------------
-    // 3. Build earcut polygon rings
+    // 4. Build earcut polygon rings
     //    - For convex curves: polygon edge goes directly a->b (skip c)
     //    - For concave curves: insert c between a and b in the ring
     // ---------------------------------------------------------------
@@ -330,35 +414,29 @@ Glyphlet FontProcessor::processGlyph(int codepoint)
     }
 
     // ---------------------------------------------------------------
-    // 4. Triangulate with earcut
-    //    Largest contour (by |area|) = outer, rest = holes
+    // 5. Triangulate with earcut
+    //    Outer ring first, then holes (matches isHole marking above).
     // ---------------------------------------------------------------
-    struct ContourOrder {
-        size_t index;
-        float  absArea;
-    };
-    std::vector<ContourOrder> order;
-    for (size_t ci = 0; ci < contours.size(); ++ci)
-        order.push_back({ci, std::fabs(signedArea(contours[ci].ringPts))});
-    std::sort(order.begin(), order.end(),
-              [](const ContourOrder& a, const ContourOrder& b) { return a.absArea > b.absArea; });
-
-    // Build earcut input: [outer, hole0, hole1, ...]
     using Polygon = std::vector<std::vector<std::array<float,2>>>;
     Polygon polygon;
     std::vector<uint32_t> flatToFull;  // earcut flat index -> allVerts index
 
-    for (auto& o : order) {
-        auto& c = contours[o.index];
+    auto appendRing = [&](const Contour& c) {
         polygon.push_back(c.ringPts);
-        for (auto idx : c.ringToFull)
-            flatToFull.push_back(idx);
+        flatToFull.insert(flatToFull.end(), c.ringToFull.begin(), c.ringToFull.end());
+    };
+
+    // Build earcut input: [outer, hole0, hole1, ...]
+    appendRing(contours[outerContourIndex]);
+    for (size_t ci = 0; ci < contours.size(); ++ci) {
+        if (ci == outerContourIndex) continue;
+        appendRing(contours[ci]);
     }
 
     auto earcutIdx = mapbox::earcut<uint32_t>(polygon);
 
     // ---------------------------------------------------------------
-    // 5. Build the final glyphlet
+    // 6. Build the final glyphlet
     // ---------------------------------------------------------------
     gl.vertices = allVerts;
 

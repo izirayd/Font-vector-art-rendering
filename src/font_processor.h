@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <filesystem>
 #include <unordered_map>
 
 // Triangle type constants matching HLSL
@@ -45,8 +46,16 @@ struct FontGPUData {
 
 class FontProcessor {
 public:
-    // Load a TTF font file. Returns false on failure.
-    bool loadFont(const std::string& fontPath, float pixelHeight);
+    FontProcessor() = default;
+    ~FontProcessor();
+
+    FontProcessor(const FontProcessor&) = delete;
+    FontProcessor& operator=(const FontProcessor&) = delete;
+    FontProcessor(FontProcessor&& other) noexcept;
+    FontProcessor& operator=(FontProcessor&& other) noexcept;
+
+    // Load a font file (TTF/OTF/TTC). Returns false on failure.
+    bool loadFont(const std::filesystem::path& fontPath, float pixelHeight);
 
     // Process a specific character and return its glyphlet.
     Glyphlet processGlyph(int codepoint);

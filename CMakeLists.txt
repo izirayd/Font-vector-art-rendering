@@ -4,6 +4,47 @@ project(MeshShaderFont LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# ---------------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------------
+include(FetchContent)
+
+# Dear ImGui (Win32 + DX12 backends)
+FetchContent_Declare(
+    imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG        v1.92.5
+)
+FetchContent_GetProperties(imgui)
+if(NOT imgui_POPULATED)
+    FetchContent_Populate(imgui)
+endif()
+
+add_library(imgui STATIC
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_dx12.cpp
+)
+
+target_include_directories(imgui PUBLIC
+    ${imgui_SOURCE_DIR}
+    ${imgui_SOURCE_DIR}/backends
+)
+
+target_compile_definitions(imgui PUBLIC
+    IMGUI_IMPL_WIN32_DISABLE_GAMEPAD
+)
+
+target_link_libraries(imgui PUBLIC
+    d3d12
+    dxgi
+    dxguid
+    imm32
+)
+
 # Find DXC compiler
 find_program(DXC_COMPILER dxc
     HINTS
@@ -47,6 +88,7 @@ add_custom_target(CompileShaders DEPENDS ${MS_HEADER} ${PS_HEADER})
 add_executable(MeshShaderFont WIN32
     src/main.cpp
     src/font_processor.cpp
+    src/camera2d.cpp
 )
 
 add_dependencies(MeshShaderFont CompileShaders)
@@ -61,4 +103,6 @@ target_link_libraries(MeshShaderFont PRIVATE
     d3d12
     dxgi
     dxguid
+    comdlg32
+    imgui
 )
